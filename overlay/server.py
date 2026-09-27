@@ -268,6 +268,161 @@ def variance_actual_vs_budget(
         return _error(exc)
 
 
+# --------------------------------------------------------------------------- #
+# Planning skill: rolling forecast, gap to budget, what-if
+# --------------------------------------------------------------------------- #
+_BASE = ["Sales", "COGS", "Marketing", "Payroll"]
+
+
+def _derive(t: dict[str, float]) -> dict[str, float]:
+    margin = t["Sales"] - t["COGS"]
+    exp = t["Marketing"] + t["Payroll"]
+    return {"Sales": round(t["Sales"], 2), "Margin": round(margin, 2), "Total Expenses": round(exp, 2),
+            "Profit": round(margin - exp, 2),
+            "Margin %": round(margin / t["Sales"] * 100, 2) if t["Sales"] else 0.0}
+
+
+def _monthly(market: str, scenario: str) -> dict[str, list[float]]:
+    prods = list(cube.PRODUCTS)
+    return {k: [cube.value(k, [m], [market], prods, scenario) for m in cube.MONTHS] for k in _BASE}
+
+
+def _project(series: list[float], n_actual: int, method: str) -> list[float]:
+    """Project months n_actual..11 from the first n_actual actual months."""
+    hist = series[:n_actual]
+    remaining = 12 - n_actual
+    if method == "run_rate":
+        avg = sum(hist[-3:]) / len(hist[-3:])
+        return [avg] * remaining
+    # linear trend (least squares) on the actual months
+    n = len(hist)
+    xs = list(range(n))
+    mx, my = sum(xs) / n, sum(hist) / n
+    den = sum((x - mx) ** 2 for x in xs) or 1.0
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, hist)) / den
+    return [max(0.0, my + slope * (x - mx)) for x in range(n, 12)]
+
+
+@mcp.tool()
+def forecast(
+    measure: str = "Sales",
+    actuals_through: str = "Sep",
+    method: str = "budget_phasing",
+    markets: list[str] | None = None,
+) -> dict:
+    """PLANNING. Rolling full-year forecast = actuals to date + projection of the remaining months.
+
+    measure: Sales, Margin, Total Expenses, Profit or Margin %
+    actuals_through: last closed month, e.g. "Jun" or "Sep" (default Sep = Q3 closed)
+    method: "budget_phasing" (default: remaining budget months scaled by YTD actual vs budget
+            performance, keeps seasonality), "run_rate" (average of the last 3 actual months)
+            or "trend" (linear trend of actual months; ignores seasonality)
+    markets: omit for all markets the user may see
+    Returns per market: YTD actual, remaining forecast, full-year forecast, full-year budget,
+    gap to budget and the uplift needed in the remaining months to still hit budget.
+    """
+    try:
+        user, mkts = _scope_markets(markets)
+        months = cube.resolve_months(actuals_through)
+        if len(months) != 1:
+            raise ValueError("actuals_through must be a single month, e.g. 'Sep'.")
+        n = cube.MONTHS.index(months[0]) + 1
+        if n >= 12:
+            raise ValueError("All months are actuals; pick an earlier month to forecast the rest of the year.")
+        if method not in ("trend", "run_rate", "budget_phasing"):
+            raise ValueError("method must be trend, run_rate or budget_phasing.")
+        if measure.strip().lower() not in {m.lower() for m in ("Sales", "Margin", "Total Expenses", "Profit", "Margin %")}:
+            raise ValueError("measure must be Sales, Margin, Total Expenses, Profit or Margin %.")
+        key = next(m for m in ("Sales", "Margin", "Total Expenses", "Profit", "Margin %") if m.lower() == measure.strip().lower())
+
+        rows, tot = [], {"ytd": {k: 0.0 for k in _BASE}, "rem": {k: 0.0 for k in _BASE},
+                         "bud": {k: 0.0 for k in _BASE}, "bud_rem": {k: 0.0 for k in _BASE}}
+        for mk in mkts:
+            act, bud = _monthly(mk, "Actual"), _monthly(mk, "Budget")
+            ytd = {k: sum(act[k][:n]) for k in _BASE}
+            if method == "budget_phasing":
+                rem = {k: (sum(bud[k][n:]) * (ytd[k] / sum(bud[k][:n]) if sum(bud[k][:n]) else 1.0)) for k in _BASE}
+            else:
+                rem = {k: sum(_project(act[k], n, method)) for k in _BASE}
+            fy_bud = {k: sum(bud[k]) for k in _BASE}
+            bud_rem = {k: sum(bud[k][n:]) for k in _BASE}
+            for k in _BASE:
+                tot["ytd"][k] += ytd[k]; tot["rem"][k] += rem[k]; tot["bud"][k] += fy_bud[k]; tot["bud_rem"][k] += bud_rem[k]
+            rows.append(_forecast_row(mk, key, ytd, rem, fy_bud))
+        if len(mkts) > 1:
+            rows.append(_forecast_row("Total", key, tot["ytd"], tot["rem"], tot["bud"]))
+        _audit("forecast", user=user, measure=key, actuals_through=months[0], method=method, markets=mkts)
+        return {"measure": key, "actuals_through": months[0], "method": method,
+                "remaining_months": cube.MONTHS[n:], "rows": rows, "source": "synthetic Demo.Basic",
+                "note": "Forecast is a projection, not a submitted plan. Nothing is written to the cube."}
+    except (AccessDenied, ValueError) as exc:
+        return _error(exc)
+
+
+def _forecast_row(label: str, key: str, ytd: dict, rem: dict, fy_bud: dict) -> dict:
+    fy = {k: ytd[k] + rem[k] for k in _BASE}
+    a, r, f, b = _derive(ytd), _derive(rem), _derive(fy), _derive(fy_bud)
+    row = {"market": label, "YTD Actual": a[key], "Remaining Forecast": r[key],
+           "Full-Year Forecast": f[key], "Full-Year Budget": b[key],
+           "Gap to Budget": round(f[key] - b[key], 2)}
+    if key != "Margin %":
+        needed = b[key] - a[key]
+        row["Needed in Remaining Months"] = round(needed, 2)
+        row["Change Needed vs Forecast %"] = round((needed / r[key] - 1) * 100, 2) if r[key] else None
+    return row
+
+
+@mcp.tool()
+def what_if(
+    sales_change_pct: float = 0.0,
+    cogs_change_pct: float = 0.0,
+    marketing_change_pct: float = 0.0,
+    payroll_change_pct: float = 0.0,
+    period: str = "Year",
+    scenario: str = "Budget",
+    markets: list[str] | None = None,
+) -> dict:
+    """PLANNING. What-if simulation: apply % changes to Sales, COGS, Marketing and Payroll and see
+    the impact on Margin, Profit and Margin %.
+
+    Example: "what if West sales grow 5% and marketing rises 10%" ->
+    sales_change_pct=5, marketing_change_pct=10, markets=["West"].
+    COGS moves with Sales volume, so a sales change also scales COGS unless cogs_change_pct
+    overrides the unit cost change on top of that.
+    scenario: base to simulate on, "Budget" (default) or "Actual"
+    Nothing is written to the cube; results are a sandbox simulation.
+    """
+    try:
+        user, mkts = _scope_markets(markets)
+        months = cube.resolve_months(period)
+        if scenario not in cube.SCENARIOS:
+            raise ValueError("scenario must be Actual or Budget.")
+        f = {"Sales": 1 + sales_change_pct / 100,
+             "COGS": (1 + sales_change_pct / 100) * (1 + cogs_change_pct / 100),
+             "Marketing": 1 + marketing_change_pct / 100,
+             "Payroll": 1 + payroll_change_pct / 100}
+        rows = []
+        groups = [(m, [m]) for m in mkts] + ([("Total", mkts)] if len(mkts) > 1 else [])
+        for label, gm in groups:
+            base = {k: cube.value(k, months, gm, list(cube.PRODUCTS), scenario) for k in _BASE}
+            sim = {k: base[k] * f[k] for k in _BASE}
+            b, s = _derive(base), _derive(sim)
+            rows.append({"market": label,
+                         **{f"{k} (base)": b[k] for k in ("Sales", "Profit", "Margin %")},
+                         **{f"{k} (what-if)": s[k] for k in ("Sales", "Profit", "Margin %")},
+                         "Profit Impact": round(s["Profit"] - b["Profit"], 2)})
+        _audit("what_if", user=user, period=period, scenario=scenario, markets=mkts,
+               changes={"sales": sales_change_pct, "cogs": cogs_change_pct,
+                        "marketing": marketing_change_pct, "payroll": payroll_change_pct})
+        return {"period": period, "base_scenario": scenario,
+                "assumptions_pct": {"Sales": sales_change_pct, "COGS unit cost": cogs_change_pct,
+                                    "Marketing": marketing_change_pct, "Payroll": payroll_change_pct},
+                "rows": rows, "source": "synthetic Demo.Basic",
+                "note": "Sandbox simulation. Nothing is written to the cube."}
+    except (AccessDenied, ValueError) as exc:
+        return _error(exc)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "auth": "off" if ALLOW_NO_AUTH else "entra"})
