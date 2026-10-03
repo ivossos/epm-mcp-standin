@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+WORKDIR /src
+COPY epm-mcp-standin.zip .
+RUN python -c "import zipfile; zipfile.ZipFile('epm-mcp-standin.zip').extractall('.')" && pip install --no-cache-dir -r epm-mcp-standin/requirements.txt
+# EPBCS stand-in: shared Entra plumbing + EPBCS tools on top of the Essbase stand-in package
+COPY overlay/common.py epm-mcp-standin/app/common.py
+COPY overlay/epbcs_server.py epm-mcp-standin/app/epbcs_server.py
+WORKDIR /src/epm-mcp-standin
+ENV PORT=8000
+EXPOSE 8000
+USER nobody
+CMD ["python", "-m", "app.epbcs_server"]
